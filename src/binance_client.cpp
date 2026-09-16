@@ -108,7 +108,13 @@ void BinanceClient::install_signal_handlers() {
             return;
         }
 
-        spdlog::info("Received signal {}, shutting down", signal_number);
+        if (signal_number == SIGINT) {
+            spdlog::info("Ctrl+C received, shutting down gracefully");
+        } else if (signal_number == SIGTERM) {
+            spdlog::info("SIGTERM received, shutting down gracefully");
+        } else {
+            spdlog::info("Signal {} received, shutting down gracefully", signal_number);
+        }
         stop();
     });
 }
@@ -318,13 +324,11 @@ void BinanceClient::request_stop(int exit_code) {
     flush_closed_windows();
 
     if (websocket_open_ && websocket_.is_open()) {
+        boost::beast::get_lowest_layer(websocket_).cancel();
         websocket_.async_close(
             boost::beast::websocket::close_code::normal,
             [this](boost::beast::error_code error) {
                 websocket_open_ = false;
-                if (error && error != boost::asio::error::operation_aborted) {
-                    spdlog::warn("WebSocket close failed: {}", error.message());
-                }
                 io_context_.stop();
             });
         return;

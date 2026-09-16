@@ -1,29 +1,15 @@
 # Binance Market Data Aggregator
 
-Linux C++ service for collecting Binance Spot `@trade` WebSocket events, aggregating per-symbol statistics in tumbling exchange-time windows, and appending closed windows to a plain-text output file.
-
-This repository is currently at Phase 2: project skeleton. The source layout, build system, dependency wiring, example config, and initial test target are present; the WebSocket service and full aggregation/output behavior still need to be implemented before submission.
-
-## Requirements Source
-
-The implementation follows the attached interview task PDF as the product specification:
-
-- C++17 or newer. This project uses C++17.
-- Linux target platform.
-- CMake + Conan build.
-- Symbols, window size, flush interval, and output path must come from one config file passed as the only command-line argument.
-- Aggregation logic must be testable without network I/O.
-- Unit tests must run through `ctest` or one documented command.
-- Production reconnection, metrics endpoints, databases, Docker/systemd packaging, order-book streams, REST API, benchmarking, and output rotation are out of scope.
+Linux C++17 service that connects to the public Binance Spot WebSocket API, subscribes to `@trade` streams for a configurable set of symbols, aggregates per-symbol statistics in tumbling exchange-time windows, and periodically appends closed windows to a plain-text file.
 
 ## Tested Environment
 
-To be filled after the first WSL build:
+Fill in after building on Linux:
 
-- Distro: TODO
-- Compiler: TODO
-- CMake: TODO
-- Conan: TODO
+- Distro: 
+- Compiler:
+- CMake:
+- Conan:
 
 ## Build
 
@@ -37,49 +23,62 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
+Language standard: **C++17** (`CMAKE_CXX_STANDARD 17`).
+
+Dependencies (Conan): Boost.Beast/Asio, OpenSSL, nlohmann/json, spdlog, GoogleTest.
+
 ## Run
 
 ```bash
 ./build/binance_aggregator config/example.json
 ```
 
-The final service must open `output_file` in append mode. The example configuration writes to `output/aggregates.txt`.
+The only command-line argument is the configuration file. The example config writes to `output/aggregates.txt` in append mode. Stop with Ctrl-C (SIGINT) or SIGTERM.
 
-## Project Layout
+Example configuration keys: `symbols`, `window_ms`, `flush_interval_ms`, `output_file`.
 
-```text
-CMakeLists.txt
-conanfile.txt
-config/example.json
-output/
-src/
-tests/
-```
+## Architecture
 
-Main components planned:
+The process is split so aggregation can be tested without network I/O.
 
-- `config`: reads the JSON configuration file.
-- `trade_parser`: converts Binance raw or combined `@trade` payloads into internal trade events.
-- `aggregator`: owns exchange-time tumbling-window state and closed-window serialization.
-- `binance_client`: planned Boost.Beast/Asio WebSocket boundary for Binance Spot streams.
-- `main`: command-line validation, config loading, service lifetime, and signal handling.
+| Component | Role |
+|---|---|
+| `main` | Validates `argc`, loads config, constructs the client, returns its exit code. |
+| `config` | Reads JSON into `AppConfig`. |
+| `binance_client` | TLS WebSocket to `wss://stream.binance.com:9443`, flush timer, signals, append-only output file. |
+| `trade_parser` | Turns raw or combined `@trade` JSON into a `Trade` (`s`, `p`, `q`, `T`). Malformed payloads become empty. |
+| `aggregator` | Tumbling windows keyed by `(window_start_ms, symbol)`, late-trade watermark, output serialization. |
 
-## Threading Model
+`binance_aggregator_core` is the library used by both the service and unit tests. `BinanceClient` links only into the `binance_aggregator` executable.
 
-Planned model: a single Boost.Asio event loop handles WebSocket reads, a periodic flush timer, and SIGINT/SIGTERM shutdown. Aggregation stays on that same thread, so no mutexes should be needed for the core path.
+### Threading model
 
-## Data Flow
+A **single Boost.Asio `io_context` thread** owns:
 
-1. Read one config file path from `argv[1]`.
-2. Subscribe to `<symbol>@trade` streams for every configured symbol.
-3. Parse each Binance trade payload robustly; malformed payloads are logged and skipped.
-4. Aggregate by `(symbol, window_start_ms)` using exchange timestamp `T`.
-5. Every `flush_interval_ms` of wall-clock time, append all closed windows ordered by `(window_start, symbol)`.
-6. On SIGINT/SIGTERM, flush closed windows, close the connection and output file, and exit with code 0.
+- DNS, TCP, TLS, and WebSocket handshake
+- `async_read` of each frame
+- the `flush_interval_ms` `steady_timer`
+- SIGINT/SIGTERM via `signal_set`
+
+`Aggregator` is only touched from those callbacks, so the hot path has no mutexes.
+
+### Data flow
+
+1. Load config from `argv[1]`.
+2. Open `output_file` in append mode; subscribe to a combined stream `/stream?streams=<symbol>@trade/...`.
+3. Parse each payload. Unexpected JSON is logged and skipped; aggregates are left unchanged.
+4. Bucket trades by exchange timestamp `T`: `window_start_ms = (T / window_ms) * window_ms` (integer division). A trade exactly on a boundary belongs to the next window.
+5. Per `(symbol, window)` keep `trades`, quote-asset `volume` (`Σ price * quantity`), `min`, and `max`.
+6. Every `flush_interval_ms` of wall-clock time, append windows whose end is in the past, ordered by `(window_start, symbol)`. Symbols with zero trades in a window emit no line. Trades for an already-flushed window are dropped, counted, and logged.
+7. On SIGINT/SIGTERM: flush closed windows, close the socket and file, exit `0`.
 
 ## Known Limitations
 
-- WebSocket connection, TLS handshake, subscription handling, periodic flushing, and graceful shutdown are not implemented yet.
-- Aggregation currently has only a minimal class skeleton.
-- Mandatory scenario tests from the PDF are not complete yet.
-- Reconnection and connection-loss recovery are intentionally out of scope for the submitted code, but the approach should be documented before the interview.
+Reconnection, metrics, databases, Docker/systemd, order-book/kline/REST streams, benchmarking, and log rotation are out of scope for this task. For real 24/7 use:
+
+- **Binance 24h disconnect.** Spot streams drop the socket about every 24 hours. The service currently treats that as a fatal read error and exits non-zero. Production should reconnect with exponential backoff, resubscribe, and keep in-memory windows that have not been flushed.
+- **TCP/TLS failures.** Resolve, connect, handshake, and mid-stream resets also stop the process. A supervisor (systemd/`restart=on-failure`) plus the backoff above would cover this.
+- **Clock skew.** Window *assignment* uses exchange `T`; *closing* a window uses local wall clock. If the host clock is behind Binance, a window can stay open too long; if it is ahead, a window can flush before the exchange has finished that interval, and later trades are dropped as late.
+- **Open window on SIGINT.** Shutdown flushes only windows that have already closed. The current incomplete window is discarded. Production could snapshot it as a partial row or keep it across a restart.
+- **Disk full / write errors.** A failed append stops the service. There is no rotation, back-pressure, or alternate sink.
+- **No persistence of live state.** Restarting loses unflushed windows. A write-ahead log or republish from a durable queue would be needed for exactly-once-ish recovery.
