@@ -6,10 +6,10 @@ Linux C++17 service that connects to the public Binance Spot WebSocket API, subs
 
 Fill in after building on Linux:
 
-- Distro: 
-- Compiler:
-- CMake:
-- Conan:
+- Distro: Ubuntu 24.04.1 LTS
+- Compiler: g++ 13.3.0
+- CMake: 3.28.3
+- Conan: 2.32.0
 
 ## Build
 
